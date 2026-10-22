@@ -1,0 +1,308 @@
+=====================================================================
+LUNAR 2.4.3 (Bedrock proxy app) - HOW IT JOINS VERSIONS AND HOW A
+MOD MENU CAN BE OPENED BY AN EMOTE
+Source: static analysis of Lunar_2_4_3.apk_ (nothing was run)
+=====================================================================
+
+
+0. READ THIS FIRST (what this document can and cannot tell you)
+---------------------------------------------------------------------
+* I only read file contents: package metadata, the JS bundle strings,
+  Android class names, and the symbol names + message text inside the
+  native Go library (libgojni.so, ~50 MB). I did not decompile or run
+  anything, so the exact logic INSIDE each function is inferred.
+* Labels used below:
+    [CONFIRMED]  seen directly in the APK (names, messages, packages)
+    [INFERRED]   my reading of how the pieces fit together
+    [NOT FOUND]  looked for it and it is not visible in the strings
+* BIGGEST FINDING: I could NOT find any "emote opens the menu" link in
+  Lunar 2.4.3. Emote packets are handled, but nothing readable ties an
+  emote to the menu. Section 5 shows what is really there, and
+  section 6 explains how an emote-triggered menu works in Bedrock so
+  you can build it for LunarVoid. Do not treat section 6 as proof of
+  how Lunar does it.
+* Second finding: Lunar does not look like a multi-version translator.
+  It follows ONE current Minecraft protocol (section 3).
+
+
+1. WHAT THE FILE IS
+---------------------------------------------------------------------
+[CONFIRMED]
+* A bundle (base.apk + split APKs for arm64, English, tvdpi).
+* Package: localhost.lunar | name: Lunar | versionName 2.4.3 |
+  versionCode 305 | minSdk 24.
+* App screen layer: React Native (Expo SDK 55, Hermes bytecode in
+  assets/index.android.bundle).
+* Proxy engine: libgojni.so, a Go library exposed to Java by JNI
+  (gomobile style: functions named Java_lunar_App_*).
+* Go module path: github.com/lunar-bedrock/lunar
+* Main Go dependencies seen:
+    - gophertunnel v1.59.1 (Bedrock protocol, packets, auth helpers)
+    - go-raknet (RakNet transport) and go-nethernet (LAN/friend worlds)
+    - parts of Dragonfly (df-mc/dragonfly)
+    - go-xsapi / xal-sisu (Xbox Live sign-in), pion/webrtc (NetherNet)
+* Go packages inside Lunar (names only):
+    lunar            -> App, AuthState, VersionInfo, protocol_mismatch.go
+    lunar/internal/relay  -> the client<->server relay
+    lunar/session    -> one proxied play session
+    lunar/player     -> player state, emote.go, inventory handling
+    lunar/player/form    -> Bedrock forms (the "menus")
+    lunar/player/control -> form widgets: Toggle, Number, Choice,
+                            Text, Color, Section, Binding
+    lunar/internal/module/... -> feature modules, incl. module/ui and
+                            module/core (chat commands)
+
+
+2. HOW A JOIN WORKS (big picture)
+---------------------------------------------------------------------
+   Minecraft (Bedrock)  --RakNet / NetherNet-->  Lunar relay
+                                                    |
+                                                    +--RakNet--> real server
+                                                    +--Realms API --> Realm
+                                                    +--Xbox friend --> friend world
+
+[CONFIRMED pieces, INFERRED order]
+Step 1  Sign-in with a Microsoft/Xbox account using the device-code
+        style flow: https://login.live.com/oauth20_remoteconnect.srf
+        with an "otc" code. The app tells users to open Minecraft and
+        sign in with that account FIRST, then use the same account in
+        Lunar (otherwise the sign-in gives "401 unauthorized").
+Step 2  Choose a target: custom server address, featured/recent
+        servers, a Realm (invite code or your Realms list), or a
+        friend's world.
+Step 3  Start the proxy. Two kinds of connection exist:
+          a) On the phone ("redirect proxy": StartRedirectProxy /
+             SetProxyAddress / SetPort in the JNI list).
+          b) Cloud/hosted mode with selectable regions. Some servers
+             block cloud IPs, and the app then tells the user to try
+             the other connection mode.
+Step 4  The user joins the proxy from Minecraft. Three ways are shown:
+          - add the shown address as a server,
+          - tap it in the LAN / local server list (NetherNet LAN
+            option exists: setNetherNetLAN),
+          - for friend worlds: add Lunar's helper Xbox account as a
+            friend and join from the Friends tab.
+Step 5  Relay loop (symbol names): Listen -> claimClient ->
+        handleClientConnection -> dialUpstream -> forward, with
+        handleClientPacket and handleServerPacket hooking every
+        packet in each direction. There is also Relog (reconnect).
+        [INFERRED: modules and menus plug into those two handlers.]
+Step 6  The app must stay open while playing; leaving the app or
+        locking the phone ends the session (message in the app).
+
+Tunable network settings exposed through JNI: upstream RakNet network
+type, downstream RakNet MTU, fast flush, tunnel privacy mode.
+
+
+3. HOW IT HANDLES MINECRAFT VERSIONS
+---------------------------------------------------------------------
+3.1  Short answer
+Lunar tracks ONE current Minecraft protocol and follows new releases
+by updating itself and its servers. I found no sign of a layer that
+translates old/new client versions to each other.
+
+3.2  Evidence
+[CONFIRMED]
+* VersionInfo object with CurrentProtocol and CurrentVersion
+  (getters/setters in JNI; App.VersionInfo()).
+* gophertunnel is pinned to one specific build (v1.59.1 + a dated
+  commit), which targets one protocol number.
+* File lunar/protocol_mismatch.go with App.protocolMismatchMessage,
+  App.SetProtocolMismatchObserver and App.versionUnsupportedKey.
+  So the Go side detects a protocol mismatch and reports it to the
+  app (the "observer"), which shows a message.
+* gophertunnel's listener config has an AcceptedProtocols field and
+  go-raknet has an "incompatible protocol version" reply; these are
+  the normal hooks a proxy uses to accept or refuse a client version.
+* Realms: AuthState.SetRealmsClientVersion tells the Realms API which
+  game version the client is, so Realm joins match the current build.
+
+[NOT FOUND]
+* Any ViaVersion-style translation packages (per-version packet or
+  block/item ID mapping tables). Absence in strings is not proof, but
+  nothing suggests multi-version support.
+
+3.3  What users see when a new Minecraft version comes out
+Two distinct messages exist (catalog keys in the Go library):
+* disconnect_servers_updating - a new Minecraft version just came out
+  and Lunar's servers are being updated; check back soon; NO app
+  update needed (cloud side is behind).
+* disconnect_app_update_needed - Lunar does not support the new
+  version yet; an app update is on the way; check back soon (the app
+  build is behind).
+Plus app-level screens:
+* A force-update screen (keys force_update_title / _description /
+  button) saying a new Lunar version is required to keep using it.
+* A translated connection error saying the user's Lunar version does
+  not support this connection and they should update and retry.
+* A "what's new" modal: the latest update adds support for the new
+  Minecraft version.
+
+3.4  How it most likely works  [INFERRED]
+1. The client sends its protocol number during login.
+2. The relay compares it with VersionInfo.CurrentProtocol.
+3. If equal -> continue the join as in section 2.
+4. If different -> refuse, and disconnect with one of the two messages
+   above. Which one depends on whether the cloud servers or the app
+   build is the part that is behind (remote config decides; the app
+   fetches a "Lunar remote config" at start).
+5. When Mojang ships a new version, the developer bumps gophertunnel
+   (new protocol, new block/item data), rebuilds, bumps VersionInfo,
+   updates the cloud servers, and ships an app update.
+
+3.5  What this means for LunarVoid
+Option A - same as Lunar (recommended first): support the newest
+  protocol only. Pin gophertunnel, store current protocol + version
+  string in one place, refuse mismatches with a clear message, and
+  keep a "servers updating" vs "app update needed" split if you also
+  run a cloud proxy.
+Option B - multi-version: you must translate packets, runtime IDs of
+  blocks/items, entity data, and chunk formats per version. This is a
+  large, ongoing job. Only consider it after Option A is stable.
+Always: show the mismatch message in the app, not just a raw
+  disconnect, so users know whether to wait or update.
+
+
+4. HOW THE MENU / UI IS REALLY OPENED IN LUNAR 2.4.3
+---------------------------------------------------------------------
+All [CONFIRMED] unless marked.
+4.1  Menus are Bedrock FORMS sent by the proxy (no resource pack
+     needed for the basic ones). Package lunar/player/form includes a
+     toggles form (title "Lunar Toggles"), a module-settings form, a
+     colour picker (RGB/hex), friends forms, waypoints, schematic,
+     server info, and others. lunar/player/control provides the
+     widgets (Toggle, Number, Choice, Text, Color, Section) and the
+     Binding that links a widget to a module setting. The many
+     "<module>_clickui_<option>" translation keys are the labels of
+     those widgets.
+     Forms can be busy: the colour forms have a RetryBusy method, i.e.
+     if the client cannot show a form right now, Lunar retries.
+4.2  Chat commands with a one-character prefix (default "."; change
+     with .prefix; the prefix cannot be "/"). Core commands: help,
+     toggles, settings, config, colors, language, ping, relog,
+     disableall, prefix. The toggles command opens the on/off
+     switches for the simple features.
+4.3  Android in-game overlay: a floating button (the app asks for
+     "show over other apps" permission). Go side: module/ui has an
+     overlay catalog + snapshot (JSON) and SetOverlayModuleEnabled /
+     SetOverlayModuleSetting; App.SetModuleOverlayActive and
+     App.DispatchInput; Session.QueueModuleOverlayAction and
+     drainModuleOverlayActions. [INFERRED] The overlay queues actions
+     that the session loop applies, so modules can be changed without
+     opening a form.
+4.4  App screens: "Open Lunar modules" and a how-to telling users to
+     join a world in Minecraft to control their modules.
+4.5  Eject: turns off all Lunar mods and commands on the server so
+     the user can play normally (App.SetEjected).
+
+
+5. EMOTES - WHAT THE APK ACTUALLY CONTAINS
+---------------------------------------------------------------------
+[CONFIRMED]
+* gophertunnel's Emote packet (protocol ID 138) and EmoteList packet
+  (ID 152) are compiled in.
+* lunar/player/emote.go exists, with Player methods DoEmote,
+  StopEmote, Emotes, GenerateEmotes and GhostHidesEmote, plus names
+  like EmoteHidden, EmoteChatMuted, EmoteLength, EmotePieces and
+  emoteCloneId. These match the usual Dragonfly-style emote API (show
+  an emote on an entity, hide it, mute its chat line). They fit
+  "mirror or simulate emotes to the client", not "open a menu".
+[NOT FOUND]
+* No message, translation key, setting, UUID constant or Android
+  class that says an emote opens the menu. Checked: the English and
+  translated message catalog, the JS UI strings, the Android classes,
+  and all 17 UUID-shaped constants in the Go library (none looks like
+  an emote ID tied to a menu).
+Conclusion: either 2.4.3 has no emote shortcut, or it exists in code
+with no readable text. I cannot claim it. If you saw it somewhere
+(another build, a video, Discord), tell me where and I can look for it.
+
+
+6. HOW AN EMOTE-TRIGGERED MENU WORKS IN BEDROCK
+   (general design for LunarVoid; NOT proven to be Lunar's method)
+---------------------------------------------------------------------
+6.1  Packets involved
+  Client -> server : Emote (138)           the player used an emote
+  Client -> server : EmoteList (152)       the player's equipped emotes
+  Server -> client : ModalFormRequest (100)  show a form
+  Client -> server : ModalFormResponse (101) result of the form
+  (Field layouts change slightly between protocol versions; read the
+  struct in the gophertunnel version you pin.)
+
+6.2  Flow
+  1. The player opens the emote wheel and taps a slot. The client
+     sends an Emote packet containing the emote's UUID (EmoteID).
+  2. Your proxy sees it in handleClientPacket. If EmoteID equals your
+     chosen "menu emote", DROP the packet (do not forward it) so the
+     real server and other players never see the emote.
+  3. Send a ModalFormRequest with your menu JSON. Use a "form" type
+     (list of buttons) for the main menu and "custom_form" for
+     settings (toggle, slider, dropdown, input).
+  4. The client answers with ModalFormResponse. Intercept it in
+     handleClientPacket, DROP it, read the button index / values,
+     apply them to your module state, then re-open or close.
+  5. Give each form your own ID range so you never swallow a real
+     server form response. Forward everything that is not yours.
+
+6.3  Details that decide whether it feels good
+  * Which emote: the wheel only offers emotes the player has
+    equipped. Read EmoteList on join and let the user pick one of
+    their slots in your app. Use the UUID you actually receive by
+    logging it; do not hardcode UUIDs from memory.
+  * Debounce: ignore repeats for ~1 second (the client can send the
+    packet again while the emote plays).
+  * Busy client: if a form cannot open (chat, inventory, loading
+    screen), the client replies with a "user busy" cancel. Retry
+    after a short delay (Lunar's RetryBusy suggests the same).
+  * Do not open forms during loading or dimension change.
+  * Server-side emotes: some servers disable or remap emotes; keep an
+    alternative (chat command prefix, app overlay button).
+  * Keep an "eject" switch that stops all interception.
+
+6.4  Small sketch (Go, gophertunnel style, untested)
+  // in handleClientPacket(pk packet.Packet) (forward bool)
+  switch p := pk.(type) {
+  case *packet.Emote:
+      if p.EmoteID == s.cfg.MenuEmoteID && s.menuDebounce.Allow() {
+          s.openMainMenu()        // writes a ModalFormRequest to client
+          return false            // swallow the emote
+      }
+  case *packet.ModalFormResponse:
+      if s.forms.Owns(p.FormID) { // only forms created by the proxy
+          s.forms.Handle(p)       // parse + apply + maybe reopen
+          return false
+      }
+  }
+  return true
+
+
+7. QUICK ANSWERS
+---------------------------------------------------------------------
+Q: How does Lunar join versions?
+A: It supports one current protocol at a time, refuses mismatches
+   with a "servers updating" or "app update needed" message, and
+   ships updates when Minecraft updates. No translator found.
+Q: Does an emote open the Lunar menu?
+A: Not confirmed. Confirmed openers are chat commands (default prefix
+   "."), forms, and the Android overlay button.
+Q: Can LunarVoid open its menu with an emote?
+A: Yes, with the packet flow in section 6 (intercept Emote, answer
+   with a ModalFormRequest, intercept the ModalFormResponse).
+
+
+8. HOW TO VERIFY THE UNKNOWN PARTS
+---------------------------------------------------------------------
+* Join through your own proxy with packet logging on and tap emotes:
+  you will see the real EmoteID values and whether the server echoes
+  them.
+* To check Lunar itself: load libgojni.so in Ghidra (arm64; Go symbol
+  names are present) and look at cross-references to
+  player.(*Player).DoEmote and to the packet.Emote type in
+  relay.handleClientPacket.
+* To confirm version logic: follow lunar.(*App).protocolMismatchMessage
+  and versionUnsupportedKey, and watch the "Lunar remote config"
+  fetch to see which flag picks which message.
+
+=====================================================================
+END
+=====================================================================
